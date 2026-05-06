@@ -60,6 +60,13 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
+const ROUTINE_EXECUTION_OPEN_LOCK_STATUSES = [
+  ...LIVE_HEARTBEAT_RUN_STATUSES,
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timed_out",
+];
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const MAX_CATCH_UP_RUNS = 25;
 const MAX_ROUTINE_REVISIONS = 100;
@@ -887,7 +894,7 @@ export function routineService(
         heartbeatRuns,
         and(
           eq(heartbeatRuns.id, issues.executionRunId),
-          inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
+          inArray(heartbeatRuns.status, ROUTINE_EXECUTION_OPEN_LOCK_STATUSES),
         ),
       )
       .where(
@@ -897,6 +904,7 @@ export function routineService(
           eq(issues.originId, originId),
           inArray(issues.status, OPEN_ISSUE_STATUSES),
           isNull(issues.hiddenAt),
+          isNotNull(issues.executionRunId),
           ...(fingerprintCondition ? [fingerprintCondition] : []),
         ),
       )

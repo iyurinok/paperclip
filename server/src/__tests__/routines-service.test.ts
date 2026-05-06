@@ -545,7 +545,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(run.status).toBe("issue_created");
     expect(wakeupResolved).toBe(true);
   });
-  it("coalesces open routine execution conflicts even when the existing issue run is terminal", async () => {
+  it("coalesces existing locked routine execution issues before duplicate-key wakeup attempts", async () => {
     const { routine, svc } = await seedFixture();
 
     const first = await svc.runRoutine(routine.id, { source: "manual" });
@@ -572,9 +572,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .select({ id: issues.id, status: issues.status, hiddenAt: issues.hiddenAt })
       .from(issues)
       .where(eq(issues.originId, routine.id));
-    expect(routineIssues).toHaveLength(2);
-    expect(routineIssues.some((issue) => issue.id === first.linkedIssueId)).toBe(true);
-    expect(routineIssues.some((issue) => issue.status === "cancelled" && issue.hiddenAt)).toBe(true);
+    expect(routineIssues).toEqual([
+      expect.objectContaining({ id: first.linkedIssueId, status: "todo", hiddenAt: null }),
+    ]);
   });
 
 
