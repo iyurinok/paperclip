@@ -1045,6 +1045,84 @@ export function routineService(
       );
   }
 
+  async function findOpenRoutineExecutionConflict(input: {
+    companyId: string;
+    originKind: string;
+    originId: string | null;
+    originFingerprint?: string | null;
+    excludeIssueId?: string | null;
+  }, executor: Db = db) {
+    if (!input.originId) return null;
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.companyId),
+          eq(issues.originKind, input.originKind),
+          eq(issues.originId, input.originId),
+          ...(input.originFingerprint ? [eq(issues.originFingerprint, input.originFingerprint)] : []),
+          ...(input.excludeIssueId ? [ne(issues.id, input.excludeIssueId)] : []),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function coalesceRoutineRunWithIssue(input: {
+    runId: string;
+    routineId: string;
+    triggerId: string | null;
+    issue: typeof issues.$inferSelect;
+    status: "coalesced" | "skipped";
+    triggeredAt: Date;
+    nextRunAt?: Date | null;
+    manualRunnerUserId?: string | null;
+  }, executor: Db = db) {
+    if (input.manualRunnerUserId) {
+      await touchIssueForUserInbox(executor, {
+        companyId: input.issue.companyId,
+        issueId: input.issue.id,
+        userId: input.manualRunnerUserId,
+        touchedAt: input.triggeredAt,
+      });
+    }
+
+    const updated = await finalizeRun(input.runId, {
+      status: input.status,
+      linkedIssueId: input.issue.id,
+      coalescedIntoRunId: input.issue.originRunId,
+      completedAt: input.triggeredAt,
+    }, executor);
+    await updateRoutineTouchedState({
+      routineId: input.routineId,
+      triggerId: input.triggerId,
+      triggeredAt: input.triggeredAt,
+      status: input.status,
+      issueId: input.issue.id,
+      nextRunAt: input.nextRunAt,
+    }, executor);
+    return updated;
+  }
+
+  function isOpenRoutineExecutionConflict(error: unknown) {
+    return !!error &&
+      typeof error === "object" &&
+      "code" in error &&
+      (error as { code?: string }).code === "23505" &&
+      (
+        ("constraint" in error && (error as { constraint?: string }).constraint === "issues_open_routine_execution_uq") ||
+        ("constraint_name" in error &&
+          (error as { constraint_name?: string }).constraint_name === "issues_open_routine_execution_uq") ||
+        ("message" in error &&
+          typeof (error as { message?: unknown }).message === "string" &&
+          (error as { message: string }).message.includes("issues_open_routine_execution_uq"))
+      );
+  }
+
   async function dispatchRoutineRun(input: {
     routine: typeof routines.$inferSelect;
     trigger: typeof routineTriggers.$inferSelect | null;
@@ -1163,27 +1241,15 @@ export function routineService(
         });
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: activeIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
-            });
-          }
-          const updated = await finalizeRun(createdRun.id, {
-            status,
-            linkedIssueId: activeIssue.id,
-            coalescedIntoRunId: activeIssue.originRunId,
-            completedAt: triggeredAt,
-          }, txDb);
-          await updateRoutineTouchedState({
+          const updated = await coalesceRoutineRunWithIssue({
+            runId: createdRun.id,
             routineId: input.routine.id,
             triggerId: input.trigger?.id ?? null,
-            triggeredAt,
+            issue: activeIssue,
             status,
-            issueId: activeIssue.id,
+            triggeredAt,
             nextRunAt,
+            manualRunnerUserId,
           }, txDb);
           return updated ?? createdRun;
         }
@@ -1210,58 +1276,80 @@ export function routineService(
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
           });
         } catch (error) {
-          const isOpenExecutionConflict =
-            !!error &&
-            typeof error === "object" &&
-            "code" in error &&
-            (error as { code?: string }).code === "23505" &&
-            "constraint" in error &&
-            (error as { constraint?: string }).constraint === "issues_open_routine_execution_uq";
+          const isOpenExecutionConflict = isOpenRoutineExecutionConflict(error);
           if (!isOpenExecutionConflict || input.routine.concurrencyPolicy === "always_enqueue") {
             throw error;
           }
 
-          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-            kind: issueOriginKind,
-            id: issueOriginId,
-          });
+          const existingIssue = await findOpenRoutineExecutionConflict({
+            companyId: input.routine.companyId,
+            originKind: issueOriginKind,
+            originId: issueOriginId,
+            originFingerprint: dispatchFingerprint,
+          }, txDb);
           if (!existingIssue) throw error;
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          if (manualRunnerUserId) {
-            await touchIssueForUserInbox(txDb, {
-              companyId: input.routine.companyId,
-              issueId: existingIssue.id,
-              userId: manualRunnerUserId,
-              touchedAt: triggeredAt,
-            });
-          }
-          const updated = await finalizeRun(createdRun.id, {
-            status,
-            linkedIssueId: existingIssue.id,
-            coalescedIntoRunId: existingIssue.originRunId,
-            completedAt: triggeredAt,
-          }, txDb);
-          await updateRoutineTouchedState({
+          const updated = await coalesceRoutineRunWithIssue({
+            runId: createdRun.id,
             routineId: input.routine.id,
             triggerId: input.trigger?.id ?? null,
-            triggeredAt,
+            issue: existingIssue,
             status,
-            issueId: existingIssue.id,
+            triggeredAt,
             nextRunAt,
+            manualRunnerUserId,
           }, txDb);
           return updated ?? createdRun;
         }
 
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
-        await queueIssueAssignmentWakeup({
-          heartbeat,
-          issue: createdIssue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "routine.dispatch",
-          requestedByActorType: input.source === "schedule" ? "system" : undefined,
-          rethrowOnError: true,
-        });
+        try {
+          await queueIssueAssignmentWakeup({
+            heartbeat,
+            issue: createdIssue,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "routine.dispatch",
+            requestedByActorType: input.source === "schedule" ? "system" : undefined,
+            rethrowOnError: true,
+          });
+        } catch (error) {
+          const existingIssue = isOpenRoutineExecutionConflict(error)
+            ? await findOpenRoutineExecutionConflict({
+              companyId: input.routine.companyId,
+              originKind: issueOriginKind,
+              originId: issueOriginId,
+              originFingerprint: dispatchFingerprint,
+              excludeIssueId: createdIssue.id,
+            }, txDb)
+            : null;
+          if (!existingIssue || input.routine.concurrencyPolicy === "always_enqueue") {
+            throw error;
+          }
+          await txDb
+            .update(issues)
+            .set({
+              status: "cancelled",
+              hiddenAt: triggeredAt,
+              executionRunId: null,
+              checkoutRunId: null,
+              executionLockedAt: null,
+            })
+            .where(eq(issues.id, createdIssue.id));
+          createdIssue = null;
+          const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+          const updated = await coalesceRoutineRunWithIssue({
+            runId: createdRun.id,
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            issue: existingIssue,
+            status,
+            triggeredAt,
+            nextRunAt,
+            manualRunnerUserId,
+          }, txDb);
+          return updated ?? createdRun;
+        }
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,

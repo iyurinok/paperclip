@@ -210,7 +210,6 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(projectRoutines.map((entry) => entry.id)).toEqual([routine.id]);
     expect(allRoutines.map((entry) => entry.id)).toEqual(expect.arrayContaining([routine.id, otherRoutine.id]));
   });
-
   it("creates a fresh execution issue when the previous routine issue is open but idle", async () => {
     const { companyId, issueSvc, routine, svc } = await seedFixture();
     const previousRunId = randomUUID();
@@ -546,6 +545,38 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(run.status).toBe("issue_created");
     expect(wakeupResolved).toBe(true);
   });
+  it("coalesces open routine execution conflicts even when the existing issue run is terminal", async () => {
+    const { routine, svc } = await seedFixture();
+
+    const first = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(first.status).toBe("issue_created");
+    expect(first.linkedIssueId).toBeTruthy();
+
+    const previousIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, first.linkedIssueId!))
+      .then((rows) => rows[0]);
+    expect(previousIssue?.executionRunId).toBeTruthy();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date("2026-03-20T12:02:00.000Z") })
+      .where(eq(heartbeatRuns.id, previousIssue!.executionRunId!));
+
+    const second = await svc.runRoutine(routine.id, { source: "manual" });
+
+    expect(second.status).toBe("coalesced");
+    expect(second.linkedIssueId).toBe(first.linkedIssueId);
+
+    const routineIssues = await db
+      .select({ id: issues.id, status: issues.status, hiddenAt: issues.hiddenAt })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(2);
+    expect(routineIssues.some((issue) => issue.id === first.linkedIssueId)).toBe(true);
+    expect(routineIssues.some((issue) => issue.status === "cancelled" && issue.hiddenAt)).toBe(true);
+  });
+
 
   it("coalesces only when the existing routine issue has a live execution run", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
