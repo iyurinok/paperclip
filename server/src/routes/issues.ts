@@ -1266,7 +1266,15 @@ export function issueRoutes(
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
-    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+    issue: {
+      id: string;
+      companyId: string;
+      status: string;
+      assigneeAgentId: string | null;
+      checkoutRunId?: string | null;
+      executionRunId?: string | null;
+      executionLockedAt?: Date | string | null;
+    },
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -1307,8 +1315,16 @@ export function issueRoutes(
     if (issue.status !== "in_progress") {
       return true;
     }
-    const runId = requireAgentRunId(req, res);
-    if (!runId) return false;
+    const runId = req.actor.runId?.trim();
+    // Chat-inline/control-plane trackers may be assigned and in_progress
+    // without ever being checked out by a Paperclip-launched run.
+    if (!runId && !issue.checkoutRunId && !issue.executionRunId && !issue.executionLockedAt) {
+      return true;
+    }
+    if (!runId) {
+      res.status(401).json({ error: "Agent run id required" });
+      return false;
+    }
     const ownership = await svc.assertCheckoutOwner(issue.id, actorAgentId, runId);
     if (ownership.adoptedFromRunId) {
       const actor = getActorInfo(req);

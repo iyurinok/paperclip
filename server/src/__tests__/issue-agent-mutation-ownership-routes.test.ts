@@ -227,6 +227,15 @@ function ownerActor() {
   };
 }
 
+function ownerActorWithoutRunId() {
+  return {
+    type: "agent",
+    agentId: ownerAgentId,
+    companyId,
+    source: "agent_key",
+  };
+}
+
 function boardActor() {
   return {
     type: "board",
@@ -458,6 +467,44 @@ describe("agent issue mutation checkout ownership", () => {
         lockedDocumentStrategy: "create_new_document",
       }),
     );
+  });
+
+  it("allows the assigned owner without a run id to mutate an unlocked active tracker", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        checkoutRunId: null,
+        executionRunId: null,
+        executionLockedAt: null,
+      }),
+    );
+
+    const res = await request(await createApp(ownerActorWithoutRunId()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Chat-inline completion" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      issueId,
+      expect.objectContaining({ title: "Chat-inline completion" }),
+    );
+  });
+
+  it.each([
+    ["checkoutRunId", { checkoutRunId: ownerRunId }],
+    ["executionRunId", { executionRunId: ownerRunId }],
+    ["executionLockedAt", { executionLockedAt: new Date("2026-07-17T00:00:00.000Z") }],
+  ])("still requires a run id when the active issue has %s", async (_name, lockFields) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue(lockFields));
+
+    const res = await request(await createApp(ownerActorWithoutRunId()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Blocked without run" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(401);
+    expect(res.body.error).toBe("Agent run id required");
+    expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("preserves committed issue updates, comments, documents, and work product writes when recovery revalidation fails", async () => {
